@@ -3,7 +3,7 @@ use std::fs;
 
 use std::path::Path;
 
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", not(target_os = "linux")))]
 fn get_block_size() -> u64 {
     // All os specific implementations of MetadataExt seem to define a block as 512 bytes
     // https://doc.rust-lang.org/std/os/linux/fs/trait.MetadataExt.html#tymethod.st_blocks
@@ -16,7 +16,7 @@ type FileTime = (i64, i64, i64);
 /// The parsed stat fields the walker consumes.
 pub type MetadataTuple = (u64, Option<InodeAndDevice>, FileTime);
 
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", not(target_os = "linux")))]
 pub fn get_metadata<P: AsRef<Path>>(
     path: P,
     use_apparent_size: bool,
@@ -33,9 +33,124 @@ pub fn get_metadata<P: AsRef<Path>>(
     }
 }
 
+#[cfg(all(target_family = "unix", not(target_os = "linux")))]
+pub fn get_metadata_and_type<P: AsRef<Path>>(
+    path: P,
+    use_apparent_size: bool,
+    follow_links: bool,
+) -> Option<(MetadataTuple, bool, bool)> {
+    let metadata = if follow_links {
+        path.as_ref().metadata()
+    } else {
+        path.as_ref().symlink_metadata()
+    };
+    metadata.ok().and_then(|md| {
+        let is_dir = md.is_dir();
+        let is_file = md.is_file();
+        tuple_from_metadata(&md, use_apparent_size).map(|t| (t, is_dir, is_file))
+    })
+}
+
+// On Linux, go through `statx` directly with `AT_STATX_DONT_SYNC`. The std's
+// `symlink_metadata`/`metadata` path already uses `statx` under the hood, but
+// with `AT_STATX_SYNC_AS_STAT` (the implicit default), which asks the
+// filesystem to force any pending metadata sync before returning. For a
+// read-only walker we don't need coherence with concurrent writers — we're
+// happy with whatever the page cache / ARC has — and for network filesystems
+// the hint can avoid a round trip. See statx(2).
+//
+// We extract fields directly from `struct statx` rather than synthesizing a
+// `std::fs::Metadata`, because `Metadata` is opaque and can't be constructed.
+// This keeps the Linux hot-path free of the detour through std.
+#[cfg(target_os = "linux")]
+fn statx_nosync<P: AsRef<Path>>(
+    path: P,
+    use_apparent_size: bool,
+    follow_links: bool,
+) -> Option<(MetadataTuple, u32)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_c = CString::new(path.as_ref().as_os_str().as_bytes()).ok()?;
+    let mut flags = libc::AT_STATX_DONT_SYNC | libc::AT_NO_AUTOMOUNT;
+    if !follow_links {
+        flags |= libc::AT_SYMLINK_NOFOLLOW;
+    }
+    let mask = libc::STATX_BASIC_STATS;
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `path_c` is a valid NUL-terminated C string for the duration of
+    // this call; `stx` is a local of the correct type and size; flags/mask are
+    // kernel-documented bit patterns.
+    let ret = unsafe { libc::statx(libc::AT_FDCWD, path_c.as_ptr(), flags, mask, &mut stx) };
+    if ret != 0 {
+        return None;
+    }
+
+    let file_size = stx.stx_size;
+    let size = if use_apparent_size {
+        file_size
+    } else {
+        let blksize = stx.stx_blksize as u64;
+        // `stx_blocks` is always in 512-byte units, regardless of blksize.
+        let reported_size = stx.stx_blocks * 512;
+        let target_size = file_size.div_ceil(blksize) * blksize;
+        let pre_allocation_buffer = blksize * 65536;
+        let max_size = target_size + pre_allocation_buffer;
+        if reported_size > max_size {
+            target_size
+        } else {
+            reported_size
+        }
+    };
+
+    // Reconstruct dev_t from (major, minor) the same way glibc's makedev
+    // does — matches `MetadataExt::dev()` so (ino, dev) pairs from statx
+    // are comparable with those from std::fs::symlink_metadata anywhere
+    // we still fall through to it.
+    let major = stx.stx_dev_major as u64;
+    let minor = stx.stx_dev_minor as u64;
+    let dev = ((major & 0xffff_f000) << 32)
+        | ((major & 0x0000_0fff) << 8)
+        | ((minor & 0xffff_ff00) << 12)
+        | (minor & 0x0000_00ff);
+
+    let tuple: MetadataTuple = (
+        size,
+        Some((stx.stx_ino, dev)),
+        (stx.stx_mtime.tv_sec, stx.stx_atime.tv_sec, stx.stx_ctime.tv_sec),
+    );
+    Some((tuple, stx.stx_mode as u32))
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_metadata<P: AsRef<Path>>(
+    path: P,
+    use_apparent_size: bool,
+    follow_links: bool,
+) -> Option<MetadataTuple> {
+    statx_nosync(path, use_apparent_size, follow_links).map(|(t, _)| t)
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_metadata_and_type<P: AsRef<Path>>(
+    path: P,
+    use_apparent_size: bool,
+    follow_links: bool,
+) -> Option<(MetadataTuple, bool, bool)> {
+    statx_nosync(path, use_apparent_size, follow_links).map(|(tuple, mode)| {
+        let ifmt = mode & (libc::S_IFMT as u32);
+        let is_dir = ifmt == libc::S_IFDIR as u32;
+        let is_file = ifmt == libc::S_IFREG as u32;
+        (tuple, is_dir, is_file)
+    })
+}
+
 /// Extract the data tuple from an already-fetched `Metadata`, no syscall.
-#[cfg(target_family = "unix")]
-pub fn tuple_from_metadata(
+/// Used on non-Linux Unix (macOS, BSDs) where we still go through std's
+/// `fs::Metadata`. On Linux we skip this entirely and read fields from
+/// `statx` directly.
+#[cfg(all(target_family = "unix", not(target_os = "linux")))]
+fn tuple_from_metadata(
     md: &std::fs::Metadata,
     use_apparent_size: bool,
 ) -> Option<MetadataTuple> {
@@ -181,6 +296,30 @@ pub fn get_metadata<P: AsRef<Path>>(
         Ok(ref md) => tuple_from_metadata(md, use_apparent_size)
             .or_else(|| get_metadata_expensive(path, use_apparent_size)),
         _ => get_metadata_expensive(path, use_apparent_size),
+    }
+}
+
+#[cfg(target_family = "windows")]
+pub fn get_metadata_and_type<P: AsRef<Path>>(
+    path: P,
+    use_apparent_size: bool,
+    follow_links: bool,
+) -> Option<((u64, Option<InodeAndDevice>, FileTime), bool, bool)> {
+    let path = path.as_ref();
+    let metadata = if follow_links {
+        path.metadata()
+    } else {
+        path.symlink_metadata()
+    };
+    match metadata {
+        Ok(md) => {
+            let is_dir = md.is_dir();
+            let is_file = md.is_file();
+            let tuple = tuple_from_metadata(&md, use_apparent_size)
+                .or_else(|| get_metadata(path, use_apparent_size, follow_links))?;
+            Some((tuple, is_dir, is_file))
+        }
+        Err(_) => None,
     }
 }
 

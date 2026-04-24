@@ -36,9 +36,10 @@ impl From<crate::cli::FileTime> for FileTime {
 /// Build a Node for a directory or file.
 ///
 /// If `cached` is `Some`, reuse the already-extracted metadata tuple to
-/// avoid a stat. `walk_dir` stats each directory once at entry and threads
-/// the result through here via `finalize_chain`. Files pass `None` since
-/// `process_entry` doesn't pre-stat them.
+/// avoid a stat. `walk_dir` stats each directory once at entry (via
+/// `get_metadata_and_type`) and threads the result through here via
+/// `finalize_chain`. Files pass `None` since `process_entry` doesn't
+/// pre-stat them.
 #[allow(clippy::too_many_arguments)]
 pub fn build_node(
     dir: PathBuf,

@@ -27,7 +27,7 @@ use crate::node::build_node;
 use std::fs::DirEntry;
 
 use crate::node::FileTime;
-use crate::platform::{MetadataTuple, get_metadata, tuple_from_metadata};
+use crate::platform::{MetadataTuple, get_metadata, get_metadata_and_type};
 
 #[derive(Debug)]
 pub enum Operator {
@@ -78,7 +78,9 @@ struct PendingDir {
     // consumed at `finalize_chain`. Avoids a second stat per directory
     // (one for the is_dir/is_file branching, one to build the Node).
     // We cache the parsed `MetadataTuple` rather than `std::fs::Metadata`
-    // — same information, ~120 B/dir smaller, and `Copy`.
+    // — same information, ~120 B/dir smaller, `Copy`, and lets `walk_dir`
+    // get the tuple straight from `get_metadata_and_type` (statx on Linux)
+    // without round-tripping through `std::fs::Metadata`.
     // `None` means the stat failed (broken symlink, raced deletion, ...).
     cached_metadata: OnceLock<Option<MetadataTuple>>,
 }
@@ -319,20 +321,21 @@ fn walk_dir<'scope>(
     pending: Arc<PendingDir>,
     walk_data: &'scope WalkData<'scope>,
 ) {
-    let md_result = if pending.is_symlink {
-        fs::metadata(&pending.dir)
-    } else {
-        fs::symlink_metadata(&pending.dir)
+    // Stat this directory once. The is_dir/is_file branching below reuses
+    // the result, and `finalize_chain` later reuses it again when building
+    // the Node — so each directory costs exactly one stat total.
+    //
+    // Symlink semantics: if `pending.is_symlink` we follow. For roots that
+    // is set in `walk_it` regardless of `follow_links` (preserving the
+    // legacy `Path::is_dir()` behavior); for children it's only ever set
+    // when `process_entry` was operating with `follow_links` on. Either
+    // way, "is_symlink => follow" is correct here.
+    let stat = get_metadata_and_type(&pending.dir, walk_data.use_apparent_size, pending.is_symlink);
+    let (is_dir_path, is_file_path) = match stat {
+        Some((_, is_dir, is_file)) => (is_dir, is_file),
+        None => (false, false),
     };
-    let (is_dir_path, is_file_path, tuple) = match &md_result {
-        Ok(m) => (
-            m.is_dir(),
-            m.is_file(),
-            tuple_from_metadata(m, walk_data.use_apparent_size),
-        ),
-        Err(_) => (false, false, None),
-    };
-    let _ = pending.cached_metadata.set(tuple);
+    let _ = pending.cached_metadata.set(stat.map(|(tuple, _, _)| tuple));
 
     if is_dir_path {
         // EINTR is the only retryable error. Looping iteratively (rather than
