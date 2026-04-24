@@ -104,11 +104,12 @@ pub fn test_hard_sym_link_no_dup_multi_arg() {
         .unwrap()
         .stdout;
 
-    // The link or the file should appear but not both
+    // Under the per-subtree dedup semantic, each argument is an independent
+    // root and deduplicates only within itself — so both the underlying file
+    // (under dir_s) and the hardlink (under dir_link_s) appear in the output.
     let output = str::from_utf8(&output).unwrap();
-    let has_file_only = output.contains(file_path_s) && !output.contains(&link_name_s);
-    let has_link_only = !output.contains(file_path_s) && output.contains(&link_name_s);
-    assert!(has_file_only || has_link_only);
+    assert!(output.contains(file_path_s));
+    assert!(output.contains(&link_name_s));
 }
 
 // Regression: dust passed a symlink-to-dir as its root path (no `-L`)

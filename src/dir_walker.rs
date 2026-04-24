@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use std::collections::HashSet;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 
 use crate::node::build_node;
 use std::fs::DirEntry;
@@ -86,11 +86,6 @@ struct PendingDir {
 }
 
 pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
-    // FxHash is substantially faster than std's default SipHash on small
-    // primitive keys and the inode dedup set sees one insert per entry — on
-    // /nix/store that's 25M probes. DoS resistance is irrelevant here; the
-    // keys are (inode, device) pairs from the filesystem, not user input.
-    let mut inodes: FxHashSet<(u64, u64)> = FxHashSet::default();
     let mut top_level_nodes: Vec<Node> = Vec::new();
 
     for d in dirs {
@@ -142,56 +137,209 @@ pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
             .store(Operation::PREPARING, ORDERING);
 
         let mut outer_children = std::mem::take(&mut *outer.children.lock().unwrap());
-        if let Some(node) = outer_children.pop()
-            && let Some(cleaned) = clean_inodes(node, &mut inodes, walk_data)
-        {
-            top_level_nodes.push(cleaned);
+        if let Some(node) = outer_children.pop() {
+            top_level_nodes.push(clean_inodes(node, walk_data));
         }
     }
     top_level_nodes
 }
 
-// Remove files which have the same inode, we don't want to double count them.
-fn clean_inodes(
-    x: Node,
-    inodes: &mut FxHashSet<(u64, u64)>,
-    walk_data: &WalkData,
-) -> Option<Node> {
-    if !walk_data.use_apparent_size
-        && let Some(id) = x.inode_device
-        && !inodes.insert(id)
-    {
-        return None;
+/// Roll up subtree sizes.
+///
+/// Semantics: `size(d) = Σ over unique (ino,dev) in subtree(d) of inode_size`.
+/// Each hardlinked inode is counted exactly once *per subtree it's in*, which
+/// means sibling subtrees that share hardlinks will each include that hardlink
+/// in their own totals (so `size(a) + size(b)` may exceed `size(parent)`). The
+/// root's total is still correct — it covers the union of all unique inodes in
+/// the tree.
+///
+/// Modes that opt out of dedup:
+/// - `use_apparent_size`: count every occurrence (matches `du --apparent-size`).
+/// - `by_filetime`: rollup is `max`, not `sum`; dedup is meaningless for
+///   timestamps and skipped.
+fn clean_inodes(x: Node, walk_data: &WalkData) -> Node {
+    if walk_data.by_filetime.is_some() {
+        return clean_no_dedup_max(x);
+    }
+    if walk_data.use_apparent_size {
+        return clean_no_dedup_sum(x);
+    }
+    clean_dedup(x).0
+}
+
+fn clean_no_dedup_max(x: Node) -> Node {
+    let mut children: Vec<Node> = x.children.into_iter().map(clean_no_dedup_max).collect();
+    children.sort_by(sort_by_inode);
+    let size = children
+        .iter()
+        .map(|c| c.size)
+        .chain(std::iter::once(x.size))
+        .max()
+        .unwrap_or(0);
+    Node {
+        name: x.name,
+        size,
+        children,
+        inode_device: x.inode_device,
+        depth: x.depth,
+    }
+}
+
+fn clean_no_dedup_sum(x: Node) -> Node {
+    let mut children: Vec<Node> = x.children.into_iter().map(clean_no_dedup_sum).collect();
+    children.sort_by(sort_by_inode);
+    let size = x.size + children.iter().map(|c| c.size).sum::<u64>();
+    Node {
+        name: x.name,
+        size,
+        children,
+        inode_device: x.inode_device,
+        depth: x.depth,
+    }
+}
+
+/// `(ino, dev) -> size`. Each entry represents one unique file in a subtree;
+/// the value is the contribution that file makes to the subtree's total size.
+type InodeSizes = FxHashMap<(u64, u64), u64>;
+
+/// Per-subtree dedup state. The vast majority of nodes in a tree are leaves
+/// with exactly one `(ino, dev)` (or none, for odd platform edge cases), so
+/// we keep that case stack-allocated and only fall back to a `FxHashMap` once
+/// a subtree actually contains more than one unique inode. This avoids ~one
+/// heap allocation per file in the tree — the primary cost of a naive map-
+/// per-subtree implementation.
+enum SubtreeInodes {
+    Empty,
+    One((u64, u64), u64),
+    Many(InodeSizes),
+}
+
+impl SubtreeInodes {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_, _) => 1,
+            Self::Many(m) => m.len(),
+        }
     }
 
-    // Sort Nodes so iteration order is predictable
-    let mut tmp: Vec<_> = x.children;
-    tmp.sort_by(sort_by_inode);
-    let new_children: Vec<_> = tmp
-        .into_iter()
-        .filter_map(|c| clean_inodes(c, inodes, walk_data))
-        .collect();
+    /// Insert `(id, v)` if the inode isn't already present. Returns `true` iff
+    /// the insert actually happened (so the caller can keep a size-sum counter
+    /// in lockstep).
+    fn insert_if_absent(&mut self, id: (u64, u64), v: u64) -> bool {
+        match self {
+            Self::Empty => {
+                *self = Self::One(id, v);
+                true
+            }
+            Self::One(existing_id, existing_v) => {
+                if *existing_id == id {
+                    false
+                } else {
+                    // Promote to Many.
+                    let mut m: InodeSizes = FxHashMap::default();
+                    m.insert(*existing_id, *existing_v);
+                    m.insert(id, v);
+                    *self = Self::Many(m);
+                    true
+                }
+            }
+            Self::Many(m) => {
+                if let std::collections::hash_map::Entry::Vacant(e) = m.entry(id) {
+                    e.insert(v);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
 
-    let actual_size = if walk_data.by_filetime.is_some() {
-        // If by_filetime is Some, directory 'size' is the maximum filetime among child files instead of disk size
-        new_children
-            .iter()
-            .map(|c| c.size)
-            .chain(std::iter::once(x.size))
-            .max()
-            .unwrap_or(0)
+    /// Drain `other` into `self`, updating `size` for each newly-inserted
+    /// inode. `other` is left `Empty` afterwards.
+    fn merge_into_self(&mut self, other: SubtreeInodes, size: &mut u64) {
+        match other {
+            Self::Empty => {}
+            Self::One(id, v) => {
+                if self.insert_if_absent(id, v) {
+                    *size += v;
+                }
+            }
+            Self::Many(m) => {
+                for (id, v) in m {
+                    if self.insert_if_absent(id, v) {
+                        *size += v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Default for SubtreeInodes {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
+/// Post-order dedup via small-to-large merging.
+///
+/// Returns `(rebuilt node, inode state of its subtree, sum of unique sizes)`.
+/// At every internal node we pick the child with the biggest inode state as
+/// the merge base and iterate only the smaller children, inserting any new
+/// `(ino, dev)` keys and accumulating their sizes. Each element moves through
+/// at most `log n` merges across the whole tree — total work `O(n log n)`.
+///
+/// The size counter is maintained incrementally (updated on `Vacant` insert)
+/// so we never re-sum the whole state.
+fn clean_dedup(x: Node) -> (Node, SubtreeInodes, u64) {
+    let mut child_results: Vec<(Node, SubtreeInodes, u64)> =
+        x.children.into_iter().map(clean_dedup).collect();
+
+    // Deterministic child order for display (the display layer re-sorts by
+    // size, but tests and --no-sort paths rely on this ordering).
+    child_results.sort_by(|a, b| sort_by_inode(&a.0, &b.0));
+
+    // Pick the biggest child's state as the merge base. Replace it with
+    // `Empty` so the subsequent "merge all" loop is a no-op on that index
+    // without needing an explicit skip.
+    let (mut state, mut size) = if let Some(biggest_idx) = child_results
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, s, _))| s.len())
+        .map(|(i, _)| i)
+    {
+        let s = std::mem::take(&mut child_results[biggest_idx].1);
+        let sz = std::mem::take(&mut child_results[biggest_idx].2);
+        (s, sz)
     } else {
-        // If by_filetime is None, directory 'size' is the sum of disk sizes or file counts of child files
-        x.size + new_children.iter().map(|c| c.size).sum::<u64>()
+        (SubtreeInodes::Empty, 0u64)
     };
 
-    Some(Node {
+    for (_, child_state, _) in &mut child_results {
+        let drained = std::mem::take(child_state);
+        state.merge_into_self(drained, &mut size);
+    }
+
+    // Include this node's own inode, if any. Directories almost always have a
+    // distinct inode from anything in their subtree; the `insert_if_absent`
+    // is just there for the theoretical edge case where they collide.
+    if let Some(id) = x.inode_device
+        && state.insert_if_absent(id, x.size)
+    {
+        size += x.size;
+    }
+
+    let new_children: Vec<Node> = child_results.into_iter().map(|(n, _, _)| n).collect();
+    let new_node = Node {
         name: x.name,
-        size: actual_size,
+        size,
         children: new_children,
         inode_device: x.inode_device,
         depth: x.depth,
-    })
+    };
+    (new_node, state, size)
 }
 
 fn sort_by_inode(a: &Node, b: &Node) -> std::cmp::Ordering {
@@ -671,39 +819,63 @@ mod tests {
         }
     }
 
-    #[test]
-    #[allow(clippy::redundant_clone)]
-    fn test_should_ignore_file() {
-        let mut inodes = FxHashSet::default();
-        let n = create_node();
-        let walkdata = create_walker(false);
-
-        // First time we insert the node
-        assert_eq!(
-            clean_inodes(n.clone(), &mut inodes, &walkdata),
-            Some(n.clone())
-        );
-
-        // Second time is a duplicate - we ignore it
-        assert_eq!(clean_inodes(n.clone(), &mut inodes, &walkdata), None);
+    #[cfg(test)]
+    fn hardlinked_pair_parent() -> Node {
+        // Two siblings sharing inode (5, 6), each reporting size 10 on its own.
+        // Under per-subtree dedup the parent should count that inode once.
+        let a = Node {
+            name: PathBuf::from("a"),
+            size: 10,
+            children: vec![],
+            inode_device: Some((5, 6)),
+            depth: 1,
+        };
+        let b = Node {
+            name: PathBuf::from("b"),
+            size: 10,
+            children: vec![],
+            inode_device: Some((5, 6)),
+            depth: 1,
+        };
+        Node {
+            name: PathBuf::from("parent"),
+            size: 4, // directory's own "metadata" size
+            children: vec![a, b],
+            inode_device: Some((100, 6)),
+            depth: 0,
+        }
     }
 
     #[test]
-    #[allow(clippy::redundant_clone)]
-    fn test_should_not_ignore_files_if_using_apparent_size() {
-        let mut inodes = FxHashSet::default();
-        let n = create_node();
-        let walkdata = create_walker(true);
+    fn test_hardlink_deduped_once_per_subtree() {
+        // parent contains two hardlinks to the same inode (size 10). Expected:
+        // parent.size = parent_own (4) + hardlinked_inode (10 once) = 14.
+        // Both children remain in the tree (their individual sizes stay at 10
+        // so drilling into either shows the "real" amount of data there).
+        let walkdata = create_walker(false);
+        let cleaned = clean_inodes(hardlinked_pair_parent(), &walkdata);
+        assert_eq!(cleaned.size, 14);
+        assert_eq!(cleaned.children.len(), 2);
+        for child in &cleaned.children {
+            assert_eq!(child.size, 10);
+        }
+    }
 
-        // If using apparent size we include Nodes, even if duplicate inodes
-        assert_eq!(
-            clean_inodes(n.clone(), &mut inodes, &walkdata),
-            Some(n.clone())
-        );
-        assert_eq!(
-            clean_inodes(n.clone(), &mut inodes, &walkdata),
-            Some(n.clone())
-        );
+    #[test]
+    fn test_apparent_size_counts_every_hardlink() {
+        // With --apparent-size we skip dedup entirely: both hardlinks count,
+        // parent.size = 4 + 10 + 10 = 24.
+        let walkdata = create_walker(true);
+        let cleaned = clean_inodes(hardlinked_pair_parent(), &walkdata);
+        assert_eq!(cleaned.size, 24);
+    }
+
+    #[test]
+    fn test_dedup_leaves_single_node_untouched() {
+        // Baseline: a single isolated node keeps its own size.
+        let n = create_node();
+        let walkdata = create_walker(false);
+        assert_eq!(clean_inodes(n.clone(), &walkdata).size, n.size);
     }
 
     #[test]
