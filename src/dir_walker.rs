@@ -488,6 +488,45 @@ fn process_entry<'scope>(
         return None;
     }
 
+    // Phase 10: under `-c` (by_filecount) without metadata-needing
+    // filters, the file's `MetadataTuple` is mostly thrown away —
+    // `node_from_tuple` sets size to 1 unconditionally and the time
+    // fields are only consulted when `-M` / `-A` / `-y` are active.
+    // The only field actually consumed downstream is `inode_device`
+    // for `clean_inodes` dedup, and both halves are available
+    // without a syscall:
+    //
+    //   * `inode` comes from `getdents64`'s `d_ino` (already returned
+    //     from the `read_dir` that gave us this entry; surfaced via
+    //     `DirEntry::ino()` on unix). On Linux's getdents64, d_ino
+    //     matches statx's stx_ino — confirmed by the kernel's filldir
+    //     callback, which copies the inode straight from the dentry.
+    //
+    //   * `dev` is the parent directory's dev. Cross-mount transitions
+    //     can only happen at directory boundaries, and each such
+    //     boundary is a fresh `walk_dir` invocation that re-stats the
+    //     mount point — so within a single dir's child list, every
+    //     non-directory entry shares its dev with the parent.
+    //
+    // Synthesise the tuple instead of statting. Kicks in only when
+    // (a) we wouldn't have stat'd for filtering anyway (prefetched is
+    // None) and (b) `-c` is on. With either condition false, fall
+    // through to `build_node`'s own fetch as before. Unix-gated:
+    // on Windows there's no cheap `d_ino`-equivalent in `DirEntry`,
+    // so the existing stat path keeps running there.
+    #[cfg(target_family = "unix")]
+    if prefetched.is_none() && walk_data.by_filecount {
+        use std::os::unix::fs::DirEntryExt;
+        let parent_dev = pending
+            .cached_metadata
+            .get()
+            .copied()
+            .flatten()
+            .and_then(|t| t.1.map(|(_, dev)| dev))
+            .unwrap_or(0);
+        prefetched = Some((0, Some((entry.ino(), parent_dev)), (0, 0, 0)));
+    }
+
     let node = build_node(
         path,
         vec![],
