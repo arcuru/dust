@@ -238,10 +238,25 @@ fn is_ignored_path(path: &Path, walk_data: &WalkData) -> bool {
     false
 }
 
+// Predicate for whether `ignore_file`'s filter checks would consult any
+// `MetadataTuple` field (dev or m/a/c times). Path-only filters (regex,
+// `--ignore-directory`) don't need a stat.
+fn filter_needs_metadata(walk_data: &WalkData) -> bool {
+    !walk_data.allowed_filesystems.is_empty()
+        || walk_data.filter_accessed_time.is_some()
+        || walk_data.filter_modified_time.is_some()
+        || walk_data.filter_changed_time.is_some()
+}
+
+// `metadata` is the entry's pre-fetched stat tuple (or `None` if nothing
+// here would have needed it). The caller fetches it once and threads it
+// through to `build_node` afterwards, so we never stat the same file
+// twice on a filter-active walk.
 fn ignore_file(
     entry: &DirEntry,
     path: &Path,
     file_type: std::fs::FileType,
+    metadata: Option<&MetadataTuple>,
     walk_data: &WalkData,
 ) -> bool {
     // `is_ignored_path` is a no-op when no ignore dirs are configured, but the
@@ -251,29 +266,17 @@ fn ignore_file(
     }
 
     let is_dot_file = entry.file_name().to_str().unwrap_or("").starts_with('.');
-    let follow_links = walk_data.follow_links && file_type.is_symlink();
+
+    if !walk_data.allowed_filesystems.is_empty()
+        && let Some((_size, Some((_id, dev)), _gunk)) = metadata
+        && !walk_data.allowed_filesystems.contains(dev)
+    {
+        return true;
+    }
 
     let has_time_filter = walk_data.filter_accessed_time.is_some()
         || walk_data.filter_modified_time.is_some()
         || walk_data.filter_changed_time.is_some();
-    let needs_metadata = !walk_data.allowed_filesystems.is_empty() || has_time_filter;
-
-    // 4a: a single stat covers both the filesystem-device check and the
-    // time-filter check. Previously the two blocks called `get_metadata`
-    // independently, so enabling both `-x` and `-M/-A/-y` cost two stats
-    // per entry.
-    let metadata = if needs_metadata {
-        get_metadata(path, false, follow_links)
-    } else {
-        None
-    };
-
-    if !walk_data.allowed_filesystems.is_empty()
-        && let Some((_size, Some((_id, dev)), _gunk)) = metadata
-        && !walk_data.allowed_filesystems.contains(&dev)
-    {
-        return true;
-    }
 
     // 4b: `file_type` from the d_type-based DirEntry::file_type already
     // tells us whether this is a regular file. For symlinks we still need
@@ -286,9 +289,9 @@ fn ignore_file(
         && let Some((_, _, (modified_time, accessed_time, changed_time))) = metadata
         && is_file_for_filter
         && [
-            (&walk_data.filter_modified_time, modified_time),
-            (&walk_data.filter_accessed_time, accessed_time),
-            (&walk_data.filter_changed_time, changed_time),
+            (&walk_data.filter_modified_time, *modified_time),
+            (&walk_data.filter_accessed_time, *accessed_time),
+            (&walk_data.filter_changed_time, *changed_time),
         ]
         .iter()
         .any(|(filter_time, actual_time)| {
@@ -430,12 +433,28 @@ fn process_entry<'scope>(
     // up to 3 times per entry.
     let path = entry.path();
     let file_type = entry.file_type().ok()?;
+    // Fetch metadata at most once per entry. Only do it when filters
+    // require it (Phase 9): without filters, the per-file stat lives
+    // inside `build_node` as before. With filters, we used to stat
+    // twice — once in `ignore_file` for the filter check, once in
+    // `build_node` to actually build the Node. Now we fetch once and
+    // thread the tuple through.
+    //
+    // Use the user's `use_apparent_size` flag at fetch time so the
+    // tuple is already in the form `build_node` wants. `ignore_file`
+    // discards the size field, so this is harmless for the filter
+    // logic but means the tuple can be reused unchanged below.
+    let mut prefetched: Option<MetadataTuple> = None;
     // Fast path: no filters means `ignore_file` has nothing to do. On a
     // default /nix/store walk this avoids a function call, a HashSet probe,
     // and an OsString allocation for `file_name` per entry. We still need
     // to honour `ignore_hidden` separately when no other filters are set.
     if walk_data.has_any_filter {
-        if ignore_file(entry, &path, file_type, walk_data) {
+        if filter_needs_metadata(walk_data) {
+            let follow_links = walk_data.follow_links && file_type.is_symlink();
+            prefetched = get_metadata(&path, walk_data.use_apparent_size, follow_links);
+        }
+        if ignore_file(entry, &path, file_type, prefetched.as_ref(), walk_data) {
             return None;
         }
     } else if walk_data.ignore_hidden
@@ -472,7 +491,7 @@ fn process_entry<'scope>(
     let node = build_node(
         path,
         vec![],
-        None,
+        prefetched,
         is_symlink,
         file_type.is_file(),
         pending.depth,
